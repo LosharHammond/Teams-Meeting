@@ -41,19 +41,34 @@ except Exception as exc:
 
 def _is_cron_request() -> bool:
     """
-    Vercel sends Authorization: Bearer <CRON_SECRET> on every scheduled invocation.
-    Also accept requests from localhost (for manual testing).
-    If CRON_SECRET is not configured, allow all (useful during initial setup).
+    Accept the request if ANY of the following is true:
+      1. CRON_SECRET is not configured (initial setup / open mode).
+      2. Authorization: Bearer <CRON_SECRET> header matches (Vercel cron / curl).
+      3. Request comes from localhost (local testing).
+      4. Request originates from the same Vercel deployment — Referer or Origin
+         header shares the same host.  This lets the dashboard "Run Poll Now"
+         button work without embedding the secret in the page HTML.
     """
     if not CRON_SECRET:
         return True
+
+    # Bearer token — Vercel cron scheduler and authorised curl calls
     auth = request.headers.get("Authorization", "")
     if auth == f"Bearer {CRON_SECRET}":
         return True
-    # Allow direct browser/curl calls from Vercel preview URLs for testing
+
     host = request.headers.get("Host", "")
+
+    # Localhost — developer testing
     if "localhost" in host or "127.0.0.1" in host:
         return True
+
+    # Same-origin dashboard button (Referer / Origin contains the same host)
+    if host:
+        for header in ("Referer", "Origin"):
+            if host in request.headers.get(header, ""):
+                return True
+
     return False
 
 
