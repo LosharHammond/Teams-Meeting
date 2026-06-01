@@ -8,7 +8,7 @@ Routes:
   POST /api/reset     — Reset meetings  { "target": "failed"|"all"|"done" }
 
 Deployment: Railway (gunicorn via Procfile / railway.json)
-Cron:       Railway Cron Service → python cron.py  [0 14 * * *]
+Cron:       Railway Cron Service → python cron.py  [* * * * *  — every minute]
 """
 import logging
 import os
@@ -376,7 +376,7 @@ def dashboard():
   <div class="card">
     <div class="card-header">
       <h2><span class="dot"></span> Meeting State Tracker</h2>
-      <span style="font-size:11px;color:#888;">Polled automatically once daily at 2:00 PM UTC</span>
+      <span style="font-size:11px;color:#888;">&#9679; Live — polls every minute, recaps delivered within 2–5 min of meeting end</span>
     </div>
     <table>
       <thead>

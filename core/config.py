@@ -21,7 +21,7 @@ SENDER_EMAIL          = os.environ.get("SENDER_EMAIL", "").strip() or ORGANIZER_
 DATABASE_URL          = _req("DATABASE_URL")
 CRON_SECRET           = os.environ.get("CRON_SECRET", "")
 
-LOOKBACK_HOURS        = int(os.environ.get("LOOKBACK_HOURS", "24"))
+LOOKBACK_HOURS        = int(os.environ.get("LOOKBACK_HOURS", "4"))
 TRANSCRIPT_TIMEOUT_H  = int(os.environ.get("TRANSCRIPT_TIMEOUT_HOURS", "26"))
 OPENAI_MODEL          = os.environ.get("OPENAI_MODEL", "gpt-4o")
 
