@@ -373,7 +373,7 @@ def dashboard():
   <div class="card">
     <div class="card-header">
       <h2><span class="dot"></span> Meeting State Tracker</h2>
-      <span style="font-size:11px;color:#888;">Auto-updates every 60 seconds via cron</span>
+      <span style="font-size:11px;color:#888;">Polled automatically once daily at 2:00 PM UTC</span>
     </div>
     <table>
       <thead>

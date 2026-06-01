@@ -22,7 +22,7 @@ DATABASE_URL          = _req("DATABASE_URL")
 CRON_SECRET           = os.environ.get("CRON_SECRET", "")
 
 LOOKBACK_HOURS        = int(os.environ.get("LOOKBACK_HOURS", "24"))
-TRANSCRIPT_TIMEOUT_H  = int(os.environ.get("TRANSCRIPT_TIMEOUT_HOURS", "4"))
+TRANSCRIPT_TIMEOUT_H  = int(os.environ.get("TRANSCRIPT_TIMEOUT_HOURS", "26"))
 OPENAI_MODEL          = os.environ.get("OPENAI_MODEL", "gpt-4o")
 
 GRAPH_V1   = "https://graph.microsoft.com/v1.0"

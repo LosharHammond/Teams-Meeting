@@ -18,9 +18,10 @@ from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 from core import db
 from core.config import (
     GRAPH_V1, GRAPH_BETA, OPENAI_API_KEY, OPENAI_MODEL,
-    ORGANIZER_EMAIL, SENDER_EMAIL, TRANSCRIPT_TIMEOUT_H,
+    SENDER_EMAIL, TRANSCRIPT_TIMEOUT_H,
 )
 from core.graph import get_organizer_oid, graph_get, graph_get_raw, graph_post
+from core.scanner import get_ended_meetings
 from core.template import render
 
 log = logging.getLogger("summarizer.pipeline")
@@ -149,11 +150,6 @@ def resolve_meeting(event: Dict) -> Optional[Dict]:
             log.warning("joinWebUrl lookup failed: HTTP %s", status)
 
     return None
-
-
-def _import_client_id() -> str:
-    from core.config import CLIENT_ID
-    return CLIENT_ID
 
 
 def _resolve_user_oid(email: str) -> str:
@@ -394,16 +390,6 @@ def process_meeting(event: Dict) -> str:
     end_dt       = _parse_dt(end_str) if end_str else datetime.now(timezone.utc)
     pending_until = (end_dt + timedelta(hours=TRANSCRIPT_TIMEOUT_H)).isoformat()
 
-    # Resolve the meeting organiser's OID once — all Graph calls on
-    # /users/{oid}/onlineMeetings MUST use the organiser's OID, not the
-    # fixed ORGANIZER_EMAIL account (any user can organise a meeting).
-    org_email = (
-        (event.get("organizer") or {})
-        .get("emailAddress", {})
-        .get("address") or ""
-    ).strip().lower()
-    org_oid = _resolve_user_oid(org_email)
-
     # ── Idempotency ────────────────────────────────────────────────────────
     row = db.get_row(ev_hash)
     if row:
@@ -418,6 +404,17 @@ def process_meeting(event: Dict) -> str:
             db.set_state(ev_hash, "FAILED", "Transcript deadline expired")
             log.warning("Abandoned (deadline expired): %s", subject)
             return "FAILED"
+
+    # Resolve the meeting organiser's OID — done AFTER the idempotency check
+    # so already-DONE/FAILED meetings skip the Graph call entirely.
+    # All /users/{oid}/onlineMeetings calls MUST use the organiser's own OID;
+    # any user in the org can organise a meeting, not just ORGANIZER_EMAIL.
+    org_email = (
+        (event.get("organizer") or {})
+        .get("emailAddress", {})
+        .get("address") or ""
+    ).strip().lower()
+    org_oid = _resolve_user_oid(org_email)
 
     # ── Resolve online meeting ─────────────────────────────────────────────
     meeting = resolve_meeting(event)
@@ -465,15 +462,15 @@ def process_meeting(event: Dict) -> str:
 
 def run_poll_cycle() -> Dict:
     """Run one full cycle. Returns a stats dict."""
-    events = __import__("core.scanner", fromlist=["get_ended_meetings"]).get_ended_meetings()
+    events = get_ended_meetings()
     stats  = {"scanned": len(events), "done": 0, "pending": 0, "failed": 0, "skipped": 0}
 
     for ev in events:
         subject = ev.get("subject", "Unknown")
         try:
             result = process_meeting(ev)
-            stats[result.lower() if result != "TRANSCRIPT_PENDING" else "pending"] = \
-                stats.get(result.lower() if result != "TRANSCRIPT_PENDING" else "pending", 0) + 1
+            key = "pending" if result == "TRANSCRIPT_PENDING" else result.lower()
+            stats[key] = stats.get(key, 0) + 1
         except Exception:
             log.exception("Unhandled error processing '%s'", subject)
             stats["failed"] += 1
