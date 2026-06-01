@@ -201,7 +201,8 @@ def dashboard():
         subj = (r.get("subject") or "—")[:55]
         state = r.get("state", "—")
         reason = r.get("fail_reason") or ""
-        updated = (r.get("updated_at") or "")[:16].replace("T", " ")
+        _upd = r.get("updated_at") or ""
+        updated = (str(_upd).replace("+00:00", "")[:16]).replace("T", " ")
         rows_html += f"""
         <tr>
           <td style="padding:10px 14px;border-bottom:1px solid #e8f5e9;">{subj}</td>
