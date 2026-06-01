@@ -16,10 +16,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from flask import Flask, jsonify, request
 
-from core import db
-from core.config import CRON_SECRET
-from core.pipeline import run_poll_cycle
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -28,11 +24,50 @@ log = logging.getLogger("summarizer.app")
 
 app = Flask(__name__)
 
-# Initialise the Postgres schema on first import
-try:
-    db.init_db()
-except Exception as exc:
-    log.error("DB init failed: %s", exc)
+# ---------------------------------------------------------------------------
+# Lazy-load all config-dependent modules so a missing env var shows a helpful
+# setup page instead of an unhandled 500 on every route.
+# ---------------------------------------------------------------------------
+_SETUP_ERROR: str = ""   # non-empty = show setup page
+_CRON_SECRET: str = ""
+
+_REQUIRED_VARS = [
+    "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET",
+    "OPENAI_API_KEY", "ORGANIZER_EMAIL", "DATABASE_URL",
+]
+
+def _bootstrap():
+    """Import heavy modules once; set _SETUP_ERROR on any failure."""
+    global _SETUP_ERROR, _CRON_SECRET
+    missing = [v for v in _REQUIRED_VARS if not os.environ.get(v, "").strip()]
+    if missing:
+        _SETUP_ERROR = (
+            "Missing required environment variables: "
+            + ", ".join(f"<code>{v}</code>" for v in missing)
+            + "<br><br>Add them in <b>Vercel → Project → Settings → Environment Variables</b>, "
+            "then redeploy."
+        )
+        return
+
+    try:
+        from core.config import CRON_SECRET
+        _CRON_SECRET = CRON_SECRET
+    except Exception as exc:
+        _SETUP_ERROR = f"Config error: {exc}"
+        return
+
+    try:
+        from core import db as _db
+        _db.init_db()
+    except Exception as exc:
+        log.error("DB init failed: %s", exc)
+        _SETUP_ERROR = (
+            f"Database connection failed: <code>{exc}</code><br><br>"
+            "Check that <b>DATABASE_URL</b> is a valid PostgreSQL connection string "
+            "(Neon, Supabase, etc.) in Vercel Environment Variables."
+        )
+
+_bootstrap()
 
 
 # ===========================================================================
@@ -49,12 +84,12 @@ def _is_cron_request() -> bool:
          header shares the same host.  This lets the dashboard "Run Poll Now"
          button work without embedding the secret in the page HTML.
     """
-    if not CRON_SECRET:
+    if not _CRON_SECRET:
         return True
 
     # Bearer token — Vercel cron scheduler and authorised curl calls
     auth = request.headers.get("Authorization", "")
-    if auth == f"Bearer {CRON_SECRET}":
+    if auth == f"Bearer {_CRON_SECRET}":
         return True
 
     host = request.headers.get("Host", "")
@@ -78,9 +113,12 @@ def _is_cron_request() -> bool:
 
 @app.route("/api/poll", methods=["GET", "POST"])
 def poll():
+    if _SETUP_ERROR:
+        return jsonify({"error": "App not configured", "detail": _SETUP_ERROR}), 503
     if not _is_cron_request():
         return jsonify({"error": "Unauthorized"}), 401
 
+    from core.pipeline import run_poll_cycle
     log.info("Poll cycle triggered")
     try:
         stats = run_poll_cycle()
@@ -93,6 +131,9 @@ def poll():
 
 @app.route("/api/status")
 def status():
+    if _SETUP_ERROR:
+        return jsonify({"error": "App not configured", "detail": _SETUP_ERROR}), 503
+    from core import db
     try:
         rows = db.all_rows()
         return jsonify({"ok": True, "meetings": rows}), 200
@@ -102,8 +143,11 @@ def status():
 
 @app.route("/api/reset", methods=["POST"])
 def reset():
+    if _SETUP_ERROR:
+        return jsonify({"error": "App not configured", "detail": _SETUP_ERROR}), 503
     if not _is_cron_request():
         return jsonify({"error": "Unauthorized"}), 401
+    from core import db
     target = (request.get_json(silent=True) or {}).get("target", "failed")
     count  = db.reset_meetings(target)
     return jsonify({"ok": True, "reset": count, "target": target}), 200
@@ -111,6 +155,34 @@ def reset():
 
 @app.route("/")
 def dashboard():
+    # Show a clear setup page if env vars are missing — no 500
+    if _SETUP_ERROR:
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Teams Summarizer — Setup Required</title>
+<style>
+  body{{font-family:'Segoe UI',Arial,sans-serif;background:#fff8e1;display:flex;
+       align-items:center;justify-content:center;min-height:100vh;margin:0;}}
+  .box{{background:#fff;border-radius:12px;padding:40px 48px;max-width:560px;
+        box-shadow:0 4px 24px rgba(0,0,0,.10);border-top:5px solid #ff8c00;}}
+  h2{{color:#e65100;margin:0 0 16px;}}
+  p{{color:#555;line-height:1.7;}}
+  .vars{{background:#f5f5f5;border-radius:8px;padding:16px 20px;margin:20px 0;}}
+  .vars li{{font-family:monospace;font-size:13px;margin:4px 0;color:#333;}}
+  a{{color:#2e7d32;font-weight:700;}}
+</style></head>
+<body><div class="box">
+  <h2>&#9888; Setup Required</h2>
+  <p>{_SETUP_ERROR}</p>
+  <div class="vars">
+    <b>Required variables:</b>
+    <ul>{"".join(f"<li>{v}</li>" for v in _REQUIRED_VARS)}</ul>
+  </div>
+  <p>After adding the variables, trigger a new Vercel deployment (push a commit
+  or click <b>Redeploy</b> in the Vercel dashboard).</p>
+</div></body></html>""", 503
+
+    from core import db
     try:
         rows = db.all_rows()
     except Exception:
