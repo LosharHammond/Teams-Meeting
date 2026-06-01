@@ -2,10 +2,11 @@
 Teams Meeting Summarizer — Flask App (Railway)
 ===============================================
 Routes:
-  GET  /              — Live dashboard
-  GET  /api/poll      — Trigger a poll cycle manually (or via cron.py)
-  GET  /api/status    — JSON list of all tracked meetings
-  POST /api/reset     — Reset meetings  { "target": "failed"|"all"|"done" }
+  GET  /                  — Live dashboard
+  GET  /api/poll          — Trigger a poll cycle manually (or via cron.py)
+  GET  /api/status        — JSON list of all tracked meetings
+  POST /api/reset         — Reset meetings  { "target": "failed"|"all"|"done" }
+  POST /api/acs-callback  — ACS bot webhook (CallConnected, RecordingFileStatusUpdated, etc.)
 
 Deployment: Railway (gunicorn via Procfile / railway.json)
 Cron:       Railway Cron Service → python cron.py  [* * * * *  — every minute]
@@ -196,6 +197,8 @@ def dashboard():
         "TRANSCRIPT_PENDING": ("#fff3cd", "#856404"),
         "FAILED":             ("#f8d7da", "#721c24"),
         "NEW":                ("#d1ecf1", "#0c5460"),
+        "BOT_JOINING":        ("#e8eaf6", "#283593"),
+        "BOT_RECORDING":      ("#fce4ec", "#880e4f"),
     }
 
     rows_html = ""
@@ -435,6 +438,110 @@ def dashboard():
 </script>
 </body>
 </html>"""
+
+
+@app.route("/api/acs-callback", methods=["POST"])
+def acs_callback():
+    """
+    ACS Call Automation webhook.
+    ACS sends a JSON array of CloudEvents; we handle the ones we care about.
+
+    Events handled:
+      Microsoft.Communication.CallConnected          → start recording
+      Microsoft.Communication.RecordingStateChanged  → log only
+      Microsoft.Communication.RecordingFileStatusUpdated → store recording URL
+      Microsoft.Communication.CallDisconnected       → log only
+    """
+    body = request.get_json(silent=True) or []
+    if not isinstance(body, list):
+        body = [body]
+
+    from core import db as _db
+    from core.config import ENABLE_BOT_RECORDING
+
+    for event in body:
+        event_type = event.get("type") or event.get("eventType", "")
+        data       = event.get("data") or {}
+        log.info("ACS event: %s", event_type)
+
+        # ── CallConnected — bot is in the call → start recording ────────────
+        if event_type == "Microsoft.Communication.CallConnected":
+            if not ENABLE_BOT_RECORDING:
+                continue
+
+            call_connection_id = data.get("callConnectionId", "")
+            server_call_id     = data.get("serverCallId", "")
+            event_hash         = request.args.get("event_hash", "")
+
+            if not call_connection_id or not server_call_id:
+                log.warning("CallConnected missing IDs — skipping")
+                continue
+
+            from core.bot import start_recording
+            recording_id = start_recording(server_call_id, event_hash)
+            if recording_id:
+                _db.set_bot_recording(call_connection_id, server_call_id, recording_id)
+                log.info(
+                    "Recording started (call=%s, recording=%s)",
+                    call_connection_id, recording_id,
+                )
+            else:
+                log.warning("Failed to start recording for call %s", call_connection_id)
+
+        # ── RecordingStateChanged — informational ────────────────────────────
+        elif event_type == "Microsoft.Communication.RecordingStateChanged":
+            recording_state = data.get("recordingState", "")
+            log.info(
+                "RecordingStateChanged: state=%s, id=%s",
+                recording_state, data.get("recordingId", ""),
+            )
+
+        # ── RecordingFileStatusUpdated — recording is ready ──────────────────
+        elif event_type == "Microsoft.Communication.RecordingFileStatusUpdated":
+            recording_chunks = data.get("recordingStorageInfo", {}).get("recordingChunks", [])
+            if not recording_chunks:
+                log.warning("RecordingFileStatusUpdated: no recordingChunks in payload")
+                continue
+
+            # Take the first chunk's content URL (for most meetings there's only one)
+            recording_url      = recording_chunks[0].get("contentLocation", "")
+            call_connection_id = data.get("callConnectionId", "")
+
+            if not recording_url:
+                log.warning("RecordingFileStatusUpdated: empty contentLocation")
+                continue
+
+            log.info(
+                "Recording ready (call=%s): %s",
+                call_connection_id, recording_url,
+            )
+
+            # Persist the recording URL and mark TRANSCRIPT_PENDING
+            if call_connection_id:
+                _db.set_recording_url(call_connection_id, recording_url)
+            else:
+                # Fallback: look up by event_hash query param
+                event_hash = request.args.get("event_hash", "")
+                if event_hash:
+                    row = _db.get_row(event_hash)
+                    if row:
+                        _db.set_recording_url(row["call_connection_id"], recording_url)
+
+            # Trigger pipeline immediately so we don't wait for the next cron tick
+            try:
+                from core.pipeline import run_poll_cycle
+                run_poll_cycle()
+            except Exception as exc:
+                log.warning("Eager pipeline run failed: %s", exc)
+
+        # ── CallDisconnected — meeting ended ─────────────────────────────────
+        elif event_type == "Microsoft.Communication.CallDisconnected":
+            log.info(
+                "CallDisconnected (call=%s)",
+                data.get("callConnectionId", "unknown"),
+            )
+
+    return jsonify({"ok": True}), 200
 
 
 if __name__ == "__main__":

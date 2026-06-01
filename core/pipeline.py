@@ -1,7 +1,19 @@
 """
 Full meeting processing pipeline.
 
-Each step is isolated so one failure doesn't cascade.
+Two operating modes depending on whether ACS bot recording is configured:
+
+Mode A — Native transcript (no ACS setup needed):
+  ended meeting → fetch Teams-native VTT → summarise → email
+
+Mode B — Bot recording (ENABLE_BOT_RECORDING=true):
+  meeting starting → bot joins via ACS → records audio
+  meeting ended    → webhook fires → download audio → Whisper → summarise → email
+  Falls back to Mode A if native transcript is available (higher quality).
+
+State machine:
+  NEW → TRANSCRIPT_PENDING → DONE | FAILED
+  NEW → BOT_JOINING → BOT_RECORDING → TRANSCRIPT_PENDING → DONE | FAILED
 """
 import hashlib
 import html
@@ -18,15 +30,16 @@ from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 from core import db
 from core.config import (
     GRAPH_V1, GRAPH_BETA, OPENAI_API_KEY, OPENAI_MODEL,
-    SENDER_EMAIL, TRANSCRIPT_TIMEOUT_H,
+    SENDER_EMAIL, TRANSCRIPT_TIMEOUT_H, ENABLE_BOT_RECORDING,
 )
 from core.graph import get_organizer_oid, graph_get, graph_get_raw, graph_post
-from core.scanner import get_ended_meetings
+from core.scanner import get_ended_meetings, get_active_meetings
 from core.template import render
 
 log = logging.getLogger("summarizer.pipeline")
 
-_EMAIL_RE   = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
 _SYSTEM_PROMPT = textwrap.dedent("""\
     You are a professional meeting assistant. Given a meeting transcript,
     produce a clear, well-structured HTML meeting summary.
@@ -94,84 +107,19 @@ def event_hash(event_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Online meeting resolution
+# User OID resolution
 # ---------------------------------------------------------------------------
-
-def resolve_meeting(event: Dict) -> Optional[Dict]:
-    """
-    Map a calendar event to its /onlineMeetings resource via joinWebUrl filter.
-
-    The ONLY valid lookup path is:
-      GET /users/{oid}/onlineMeetings?$filter=joinWebUrl eq '...'
-
-    This requires the Teams Application Access Policy to be active.
-    /communications/onlineMeetings returns 400 for joinWebUrl (needs videoTeleconferenceId).
-    Date-range listing (?startDateTime=...&endDateTime=...) is unsupported — returns 400.
-    There is no fallback; joinWebUrl + policy is the only path.
-    """
-    join_url = ((event.get("onlineMeeting") or {}).get("joinUrl") or "").strip()
-
-    if not join_url:
-        log.warning("No joinUrl in calendar event for '%s' — cannot resolve", event.get("subject"))
-        return None
-
-    # Use the ACTUAL meeting organiser's OID — the policy (-Global) grants
-    # app access to /onlineMeetings for any user in the tenant, but the
-    # call must be scoped to the user who ORGANISED that specific meeting.
-    org_email = (
-        (event.get("organizer") or {})
-        .get("emailAddress", {})
-        .get("address") or ""
-    ).strip().lower()
-    oid = _resolve_user_oid(org_email)
-
-    try:
-        items = graph_get(
-            f"{GRAPH_V1}/users/{oid}/onlineMeetings",
-            {"$filter": f"joinWebUrl eq '{join_url}'"},
-        ).get("value", [])
-        if items:
-            return items[0]
-    except requests.HTTPError as exc:
-        status = getattr(exc.response, "status_code", 0)
-        if status == 403:
-            log.warning(
-                "403 — Teams Application Access Policy not yet active for OID %s.\n"
-                "The policy must be GRANTED to this user. Run in Teams PowerShell (admin):\n"
-                "  Grant-CsApplicationAccessPolicy "
-                "-PolicyName MeetingSummarizerPolicy -Identity %s\n"
-                "Or grant org-wide:\n"
-                "  Grant-CsApplicationAccessPolicy "
-                "-PolicyName MeetingSummarizerPolicy -Global\n"
-                "Propagation takes up to 30 min. Service will keep retrying.",
-                oid, oid,
-            )
-        else:
-            log.warning("joinWebUrl lookup failed: HTTP %s", status)
-
-    return None
-
 
 def _resolve_user_oid(email: str) -> str:
     """
     Resolve any user's UPN/email to their Azure AD Object ID.
-
-    Used so that meeting lookups always use the OID of the ACTUAL meeting
-    organiser, not the fixed ORGANIZER_EMAIL account.  Any user in the org
-    can organise a meeting; the Teams Application Access Policy (granted
-    -Global) authorises the app to call /users/{any_oid}/onlineMeetings.
-
-    Falls back to the configured organiser OID if the lookup fails (e.g.
-    external organiser, guest account, or transient Graph error).
+    Falls back to the configured organiser OID on failure.
     """
     if not email:
         return get_organizer_oid()
     try:
-        user = graph_get(
-            f"{GRAPH_V1}/users/{email}",
-            {"$select": "id"},
-        )
-        oid = user.get("id", "")
+        user = graph_get(f"{GRAPH_V1}/users/{email}", {"$select": "id"})
+        oid  = user.get("id", "")
         if oid:
             log.debug("Resolved OID for %s → %s", email, oid)
             return oid
@@ -184,7 +132,47 @@ def _resolve_user_oid(email: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Transcripts
+# Online meeting resolution
+# ---------------------------------------------------------------------------
+
+def resolve_meeting(event: Dict) -> Optional[Dict]:
+    """
+    Map a calendar event to its /onlineMeetings resource via joinWebUrl filter.
+    Uses the actual meeting organiser's OID (any user can organise a meeting).
+    """
+    join_url  = ((event.get("onlineMeeting") or {}).get("joinUrl") or "").strip()
+    org_email = (
+        (event.get("organizer") or {})
+        .get("emailAddress", {}).get("address") or ""
+    ).strip().lower()
+
+    if not join_url:
+        log.warning("No joinUrl in event '%s'", event.get("subject"))
+        return None
+
+    oid = _resolve_user_oid(org_email)
+    try:
+        items = graph_get(
+            f"{GRAPH_V1}/users/{oid}/onlineMeetings",
+            {"$filter": f"joinWebUrl eq '{join_url}'"},
+        ).get("value", [])
+        if items:
+            return items[0]
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", 0)
+        if status == 403:
+            log.warning(
+                "403 — Teams Application Access Policy not active for OID %s. "
+                "Run: Grant-CsApplicationAccessPolicy -PolicyName MeetingSummarizerPolicy -Global",
+                oid,
+            )
+        else:
+            log.warning("joinWebUrl lookup failed: HTTP %s", status)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Transcripts — Teams native (VTT)
 # ---------------------------------------------------------------------------
 
 def _clean_vtt(vtt: str) -> str:
@@ -202,10 +190,11 @@ def _truncate(text: str, max_chars: int = 55_000) -> str:
     if len(text) <= max_chars:
         return text
     cut = text.rfind(".", 0, max_chars)
-    return text[: (cut + 1) if cut != -1 else max_chars] + "\n\n[Transcript truncated]"
+    return text[:(cut + 1) if cut != -1 else max_chars] + "\n\n[Transcript truncated]"
 
 
 def get_transcript_text(meeting_id: str, organizer_oid: str) -> Optional[str]:
+    """Fetch Teams-native VTT transcript via Graph API."""
     oid = organizer_oid
     try:
         transcripts = graph_get(
@@ -221,7 +210,7 @@ def get_transcript_text(meeting_id: str, organizer_oid: str) -> Optional[str]:
     parts = []
     for t in transcripts:
         try:
-            raw = graph_get_raw(
+            raw     = graph_get_raw(
                 f"{GRAPH_BETA}/users/{oid}/onlineMeetings/{meeting_id}"
                 f"/transcripts/{t['id']}/content",
                 accept="text/vtt",
@@ -233,6 +222,26 @@ def get_transcript_text(meeting_id: str, organizer_oid: str) -> Optional[str]:
             log.warning("Transcript segment %s failed: %s", t.get("id"), exc)
 
     return "\n\n".join(parts) if parts else None
+
+
+# ---------------------------------------------------------------------------
+# Transcripts — bot recording via Whisper (fallback)
+# ---------------------------------------------------------------------------
+
+def get_transcript_from_recording(recording_url: str) -> Optional[str]:
+    """
+    Download the ACS bot recording from Azure Blob and transcribe with Whisper.
+    Used when Teams-native transcript is unavailable.
+    """
+    from core.bot       import download_recording
+    from core.transcribe import transcribe_audio
+
+    audio = download_recording(recording_url)
+    if not audio:
+        log.warning("Could not download recording from %s", recording_url)
+        return None
+
+    return transcribe_audio(audio)
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +382,73 @@ def send_email(recipients: List[str], subject: str, summary_html: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Bot joining — called by the active-meeting cron pass
+# ---------------------------------------------------------------------------
+
+def dispatch_bot_for_active_meetings() -> Dict:
+    """
+    Scan for meetings currently in progress and dispatch the ACS bot to join
+    any that haven't been processed or joined yet.
+    Only runs when ENABLE_BOT_RECORDING=true.
+    """
+    if not ENABLE_BOT_RECORDING:
+        return {"bot_dispatched": 0, "bot_skipped": 0}
+
+    from core.bot import join_and_record
+
+    active = get_active_meetings()
+    dispatched = 0
+    skipped    = 0
+
+    for ev in active:
+        ev_id    = ev.get("id", "")
+        ev_hash  = event_hash(ev_id)
+        subject  = ev.get("subject") or "Untitled Meeting"
+        join_url = ((ev.get("onlineMeeting") or {}).get("joinUrl") or "").strip()
+        end_str  = (ev.get("end") or {}).get("dateTime", "")
+        start_str = (ev.get("start") or {}).get("dateTime", "")
+        end_dt   = _parse_dt(end_str) if end_str else datetime.now(timezone.utc)
+        pending_until = (end_dt + timedelta(hours=TRANSCRIPT_TIMEOUT_H)).isoformat()
+
+        if not join_url:
+            continue
+
+        # Skip if already in a terminal or active-bot state
+        row = db.get_row(ev_hash)
+        if row and row["state"] in ("DONE", "FAILED", "BOT_JOINING", "BOT_RECORDING"):
+            skipped += 1
+            continue
+
+        # Insert/update the DB record first
+        db.upsert(
+            event_hash=ev_hash, event_id=ev_id, meeting_id=None,
+            subject=subject, meeting_end=end_str, pending_until=pending_until,
+            state="NEW", join_url=join_url,
+        )
+
+        call_connection_id = join_and_record(join_url, ev_hash)
+        if call_connection_id:
+            db.set_bot_joining(ev_hash, call_connection_id)
+            log.info("Bot dispatched for '%s' (call_id=%s)", subject, call_connection_id)
+            dispatched += 1
+        else:
+            skipped += 1
+
+    return {"bot_dispatched": dispatched, "bot_skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline — process one ended meeting
 # ---------------------------------------------------------------------------
 
 def process_meeting(event: Dict) -> str:
     """
     Process one calendar event end-to-end.
-    Returns the final state: 'DONE', 'TRANSCRIPT_PENDING', 'FAILED', or 'SKIPPED'.
+    Returns: 'DONE' | 'TRANSCRIPT_PENDING' | 'FAILED' | 'SKIPPED'
+
+    Transcript priority:
+      1. Teams-native VTT (best quality, has speaker names)
+      2. ACS bot recording → Whisper (fallback when no native transcript)
     """
     subject      = event.get("subject") or "Untitled Meeting"
     ev_id        = event.get("id", "")
@@ -398,21 +467,21 @@ def process_meeting(event: Dict) -> str:
             log.debug("Already done: %s", subject)
             return "SKIPPED"
         if state == "FAILED":
-            log.debug("Previously failed: %s (%s)", subject, row.get("fail_reason"))
+            log.debug("Previously failed: %s", subject)
             return "SKIPPED"
+        # Bot is still recording — don't interrupt, wait for webhook
+        if state in ("BOT_JOINING", "BOT_RECORDING"):
+            log.debug("Bot in progress for '%s' — waiting", subject)
+            return "TRANSCRIPT_PENDING"
         if state == "TRANSCRIPT_PENDING" and db.is_expired(row):
             db.set_state(ev_hash, "FAILED", "Transcript deadline expired")
             log.warning("Abandoned (deadline expired): %s", subject)
             return "FAILED"
 
-    # Resolve the meeting organiser's OID — done AFTER the idempotency check
-    # so already-DONE/FAILED meetings skip the Graph call entirely.
-    # All /users/{oid}/onlineMeetings calls MUST use the organiser's own OID;
-    # any user in the org can organise a meeting, not just ORGANIZER_EMAIL.
+    # Resolve organiser OID after idempotency — skip for already-done meetings
     org_email = (
         (event.get("organizer") or {})
-        .get("emailAddress", {})
-        .get("address") or ""
+        .get("emailAddress", {}).get("address") or ""
     ).strip().lower()
     org_oid = _resolve_user_oid(org_email)
 
@@ -424,7 +493,6 @@ def process_meeting(event: Dict) -> str:
             subject=subject, meeting_end=end_str, pending_until=pending_until,
             state="TRANSCRIPT_PENDING",
         )
-        log.info("Meeting not resolvable yet: '%s' — retrying", subject)
         return "TRANSCRIPT_PENDING"
 
     meeting_id = meeting["id"]
@@ -434,11 +502,25 @@ def process_meeting(event: Dict) -> str:
         state="NEW",
     )
 
-    # ── Transcript ────────────────────────────────────────────────────────
+    # ── Transcript: try Teams-native first ────────────────────────────────
     transcript = get_transcript_text(meeting_id, org_oid)
+
+    # ── Transcript: fall back to bot recording if native unavailable ──────
+    if not transcript or len(transcript.strip()) < 50:
+        row = db.get_row(ev_hash)
+        recording_url = row.get("recording_url") if row else None
+
+        if recording_url:
+            log.info("No native transcript — using bot recording for '%s'", subject)
+            transcript = get_transcript_from_recording(recording_url)
+        else:
+            db.set_state(ev_hash, "TRANSCRIPT_PENDING")
+            log.info("No transcript yet for '%s' (native or bot recording)", subject)
+            return "TRANSCRIPT_PENDING"
+
     if not transcript or len(transcript.strip()) < 50:
         db.set_state(ev_hash, "TRANSCRIPT_PENDING")
-        log.info("No transcript yet for '%s'", subject)
+        log.info("Transcript too short for '%s' — will retry", subject)
         return "TRANSCRIPT_PENDING"
 
     log.info("Transcript ready for '%s' (%d chars)", subject, len(transcript))
@@ -460,10 +542,28 @@ def process_meeting(event: Dict) -> str:
     return "DONE"
 
 
+# ---------------------------------------------------------------------------
+# Poll cycle — called by cron.py every minute
+# ---------------------------------------------------------------------------
+
 def run_poll_cycle() -> Dict:
-    """Run one full cycle. Returns a stats dict."""
+    """
+    Run one full cycle:
+      1. Dispatch bot to any meetings currently in progress (if bot enabled)
+      2. Process all recently-ended meetings (native or bot transcript)
+    Returns a stats dict.
+    """
+    stats: Dict = {"done": 0, "pending": 0, "failed": 0, "skipped": 0,
+                   "bot_dispatched": 0}
+
+    # Pass 1: join active meetings with bot
+    if ENABLE_BOT_RECORDING:
+        bot_stats = dispatch_bot_for_active_meetings()
+        stats["bot_dispatched"] = bot_stats.get("bot_dispatched", 0)
+
+    # Pass 2: process ended meetings
     events = get_ended_meetings()
-    stats  = {"scanned": len(events), "done": 0, "pending": 0, "failed": 0, "skipped": 0}
+    stats["scanned"] = len(events)
 
     for ev in events:
         subject = ev.get("subject", "Unknown")

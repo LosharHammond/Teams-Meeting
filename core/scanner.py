@@ -1,17 +1,19 @@
 """
 Org-wide calendar scanner.
 
-Uses a ThreadPoolExecutor to scan all licensed users' calendars in parallel
-so the full scan stays well within Vercel's 60-second function timeout.
+Uses a ThreadPoolExecutor to scan all licensed users' calendars in parallel.
+Provides two scan modes:
+  - get_ended_meetings()  — meetings that finished in the last LOOKBACK_HOURS
+  - get_active_meetings() — meetings currently in progress (bot joining target)
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import requests
 
-from core.config import GRAPH_V1, LOOKBACK_HOURS, ORGANIZER_EMAIL
+from core.config import GRAPH_V1, LOOKBACK_HOURS
 from core.graph import get_organizer_oid, graph_get
 
 log = logging.getLogger("summarizer.scanner")
@@ -48,9 +50,7 @@ def get_licensed_user_ids() -> List[str]:
 # Calendar fetch for one user
 # ---------------------------------------------------------------------------
 
-def _fetch_user_calendar(
-    oid: str, start: datetime, end: datetime
-) -> List[Dict]:
+def _fetch_user_calendar(oid: str, start: datetime, end: datetime) -> List[Dict]:
     try:
         return graph_get(
             f"{GRAPH_V1}/users/{oid}/calendarView",
@@ -71,60 +71,101 @@ def _fetch_user_calendar(
             except Exception:
                 code = ""
             if code in _MAILBOX_SKIP_CODES or status == 404:
-                return []   # expected — on-prem / inactive mailbox
+                return []
         log.warning("Calendar fetch failed for OID %s: HTTP %s", oid, status)
         return []
 
-
-# ---------------------------------------------------------------------------
-# Org-wide scan
-# ---------------------------------------------------------------------------
 
 def _parse_dt(dt_str: str) -> datetime:
     dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+# ---------------------------------------------------------------------------
+# Org-wide scan helpers
+# ---------------------------------------------------------------------------
+
+def _scan_all_calendars(start: datetime, end: datetime) -> Dict[str, Dict]:
+    """
+    Scan every licensed user's calendar for the given window.
+    Returns a dict keyed by joinUrl → event (keeping the copy with most attendees).
+    """
+    user_ids = get_licensed_user_ids()
+    log.info("Scanning %d calendars (%d workers)", len(user_ids), _MAX_WORKERS)
+
+    seen: Dict[str, Dict] = {}
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_user_calendar, uid, start, end): uid
+                   for uid in user_ids}
+        for future in as_completed(futures):
+            for ev in (future.result() or []):
+                if not ev.get("isOnlineMeeting"):
+                    continue
+                key = (ev.get("onlineMeeting") or {}).get("joinUrl") or ev.get("id", "")
+                if not key:
+                    continue
+                if key not in seen:
+                    seen[key] = ev
+                elif len(ev.get("attendees", [])) > len(seen[key].get("attendees", [])):
+                    seen[key] = ev
+
+    return seen
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def get_ended_meetings() -> List[Dict]:
     """
-    Return deduplicated ended Teams meetings from every user's calendar.
-    Parallel fetches via ThreadPoolExecutor.
+    Return deduplicated Teams meetings that ended within the last LOOKBACK_HOURS.
+    These are candidates for transcript fetch + summarisation.
     """
     now   = datetime.now(timezone.utc)
     start = now - timedelta(hours=LOOKBACK_HOURS)
 
-    user_ids = get_licensed_user_ids()
-    log.info("Scanning %d calendars (parallel, %d workers)", len(user_ids), _MAX_WORKERS)
+    seen  = _scan_all_calendars(start, now)
 
-    seen: Dict[str, Dict] = {}   # joinUrl → best event
-    scanned = 0
+    ended = [
+        ev for ev in seen.values()
+        if (ev.get("end") or {}).get("dateTime", "")
+        and _parse_dt((ev["end"])["dateTime"]) < now
+    ]
 
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_user_calendar, uid, start, now): uid
-                   for uid in user_ids}
-        for future in as_completed(futures):
-            events = future.result()
-            if events is not None:
-                scanned += 1
-            for ev in (events or []):
-                if not ev.get("isOnlineMeeting"):
-                    continue
-                end_str = (ev.get("end") or {}).get("dateTime", "")
-                if not end_str or _parse_dt(end_str) >= now:
-                    continue
-
-                key = (ev.get("onlineMeeting") or {}).get("joinUrl") or ev.get("id", "")
-                if not key:
-                    continue
-
-                if key not in seen:
-                    seen[key] = ev
-                elif len(ev.get("attendees", [])) > len(seen[key].get("attendees", [])):
-                    seen[key] = ev   # keep copy with the most attendees
-
-    ended = list(seen.values())
-    log.info(
-        "Scan done — %d mailboxes scanned, %d no-mailbox skipped, %d unique ended meetings",
-        scanned, len(user_ids) - scanned, len(ended),
-    )
+    log.info("Ended meetings in last %dh: %d", LOOKBACK_HOURS, len(ended))
     return ended
+
+
+def get_active_meetings() -> List[Dict]:
+    """
+    Return deduplicated Teams meetings that are CURRENTLY IN PROGRESS.
+    These are candidates for bot joining — the bot must join before they end.
+
+    A meeting is considered active if:
+      - start.dateTime is in the past
+      - end.dateTime is in the future (or up to 30 min in the past, to catch
+        overruns — scheduled end times are often earlier than actual end)
+    """
+    now      = datetime.now(timezone.utc)
+    # Look back 4h (meetings that started up to 4h ago and might still be running)
+    # Look forward 15m (to catch meetings just about to start — bot joins early)
+    scan_start = now - timedelta(hours=4)
+    scan_end   = now + timedelta(minutes=15)
+
+    seen = _scan_all_calendars(scan_start, scan_end)
+
+    active = []
+    for ev in seen.values():
+        start_str = (ev.get("start") or {}).get("dateTime", "")
+        end_str   = (ev.get("end")   or {}).get("dateTime", "")
+        if not start_str or not end_str:
+            continue
+        meeting_start = _parse_dt(start_str)
+        meeting_end   = _parse_dt(end_str)
+        # Active = started ≤ now AND scheduled end > now - 30min
+        if meeting_start <= now and meeting_end > now - timedelta(minutes=30):
+            active.append(ev)
+
+    log.info("Active meetings right now: %d", len(active))
+    return active
