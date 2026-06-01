@@ -1,8 +1,27 @@
+# Secrets — never commit
 .env
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.vercel/
+*.pyd
+
+# Virtual environments
 venv/
 .venv/
+env/
+
+# Local databases
 *.db
+*.sqlite3
+
+# Vercel (no longer used)
+.vercel/
+
+# Railway local dev
+.railway/
+
+# OS
+.DS_Store
+Thumbs.db

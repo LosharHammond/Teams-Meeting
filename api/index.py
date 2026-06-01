@@ -1,11 +1,14 @@
 """
-Teams Meeting Summarizer — Vercel Flask App
-===========================================
+Teams Meeting Summarizer — Flask App (Railway)
+===============================================
 Routes:
   GET  /              — Live dashboard
-  GET  /api/poll      — Run one poll cycle (Vercel cron target, every minute)
+  GET  /api/poll      — Trigger a poll cycle manually (or via cron.py)
   GET  /api/status    — JSON list of all tracked meetings
   POST /api/reset     — Reset meetings  { "target": "failed"|"all"|"done" }
+
+Deployment: Railway (gunicorn via Procfile / railway.json)
+Cron:       Railway Cron Service → python cron.py  [0 14 * * *]
 """
 import logging
 import os
@@ -432,3 +435,8 @@ def dashboard():
 </script>
 </body>
 </html>"""
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
